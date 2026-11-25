@@ -76,7 +76,7 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Install container2wasm
+         - name: Install container2wasm
         run: |
           git clone --depth 1 \
             --branch v0.8.4 \
@@ -86,7 +86,6 @@ jobs:
           cd /tmp/container2wasm
           make
           sudo make install
-
       - name: Convert Docker image to WASM
         run: |
           mkdir -p release-out
