@@ -1,60 +1,159 @@
 name: Release
+
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
-    name: Build
+    name: Build VS Code Extension
     env:
       OUTPUT_DIR: ${{ github.workspace }}/release-out
+
     steps:
-    - uses: actions/checkout@v4
-    - name: Setup vsce
-      run: |
-        npm install -g @vscode/vsce
-    - name: Build package
-      run: |
-        mkdir ${OUTPUT_DIR}
-        RELEASE_TAG="${GITHUB_REF##*/}"
-        FILE_NAME="vscode-container-wasm-${RELEASE_TAG}.vsix"
-        SHA256SUM_FILE_NAME="${FILE_NAME}.sha256sum"
-        npm install
-        vsce package -o "${OUTPUT_DIR}/${FILE_NAME}"
-        ( cd ${OUTPUT_DIR}; sha256sum ${FILE_NAME} ) > "${OUTPUT_DIR}/${SHA256SUM_FILE_NAME}"
-    - name: Save package
-      uses: actions/upload-artifact@v4
-      with:
-        name: builds-package
-        path: ${{ env.OUTPUT_DIR }}/*
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Build package
+        run: |
+          mkdir -p "${OUTPUT_DIR}"
+
+          RELEASE_TAG="${GITHUB_REF##*/}"
+          FILE_NAME="vscode-container-wasm-${RELEASE_TAG}.vsix"
+
+          npm install
+          vsce package -o "${OUTPUT_DIR}/${FILE_NAME}"
+
+          (
+            cd "${OUTPUT_DIR}"
+            sha256sum "${FILE_NAME}"
+          ) > "${OUTPUT_DIR}/${FILE_NAME}.sha256sum"
+
+      - name: Save package
+        uses: actions/upload-artifact@v4
+        with:
+          name: builds-package
+          path: ${{ env.OUTPUT_DIR }}/*
+
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    name: Build Ubuntu 24.04 WASM
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Ubuntu Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: images/ubuntu-24.04
+          file: images/ubuntu-24.04/Dockerfile
+          platforms: linux/amd64
+          tags: ubuntu-wasm:24.04
+          outputs: type=docker,dest=/tmp/ubuntu-image.tar
+
+      - name: Load Docker image
+        run: docker load -i /tmp/ubuntu-image.tar
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Install container2wasm
+        run: |
+          git clone --depth 1 \
+            --branch v0.8.4 \
+            https://github.com/container2wasm/container2wasm.git \
+            /tmp/container2wasm
+
+          cd /tmp/container2wasm
+          make
+          sudo make install
+
+      - name: Convert Docker image to WASM
+        run: |
+          mkdir -p release-out
+
+          c2w ubuntu-wasm:24.04 \
+            release-out/ubuntu-24.04.wasm
+
+      - name: Generate checksum
+        run: |
+          cd release-out
+          sha256sum ubuntu-24.04.wasm > ubuntu-24.04.wasm.sha256sum
+
+      - name: Save Ubuntu WASM
+        uses: actions/upload-artifact@v4
+        with:
+          name: builds-ubuntu
+          path: release-out/*
 
   release:
     runs-on: ubuntu-22.04
     name: Release
-    needs: [build]
+    needs:
+      - build
+      - build-ubuntu
+
     env:
       OUTPUT_DIR: ${{ github.workspace }}/builds
-    steps:
-    - uses: actions/checkout@v4
-    - name: Download Builds
-      uses: actions/download-artifact@v4
-      with:
-        path: ${{ env.OUTPUT_DIR }}
-    - name: Create Release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        RELEASE_TAG="${GITHUB_REF##*/}"
-        cat <<EOF > ${GITHUB_WORKSPACE}/release-note.txt
-        ${RELEASE_TAG}
 
-        (TBD)
-        EOF
-        ASSET_ARGS=()
-        ls -al ${OUTPUT_DIR}/
-        for F in ${OUTPUT_DIR}/builds-package/* ; do
-          ASSET_ARGS+=("$F")
-        done
-        gh release create -F ${GITHUB_WORKSPACE}/release-note.txt --draft --title "${RELEASE_TAG}" "${RELEASE_TAG}" ${ASSET_ARGS[@]}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Builds
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ env.OUTPUT_DIR }}
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="${GITHUB_REF##*/}"
+
+          cat <<EOF > ${GITHUB_WORKSPACE}/release-note.txt
+          ${RELEASE_TAG}
+
+          VS Code Extension and Ubuntu 24.04 WASM image.
+          EOF
+
+          ASSET_ARGS=()
+
+          find "${OUTPUT_DIR}" -type f -print
+
+          while IFS= read -r -d '' F; do
+            ASSET_ARGS+=("$F")
+          done < <(find "${OUTPUT_DIR}" -type f -print0)
+
+          gh release create \
+            -F "${GITHUB_WORKSPACE}/release-note.txt" \
+            --draft \
+            --title "${RELEASE_TAG}" \
+            "${RELEASE_TAG}" \
+            "${ASSET_ARGS[@]}"
+
+      - name: Upload Ubuntu WASM to Cloudflare R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx --yes wrangler@4 r2 object put \
+            vscode-wasm-images/ubuntu-24.04.wasm \
+            --file="${OUTPUT_DIR}/builds-ubuntu/ubuntu-24.04.wasm" \
+            --content-type=application/wasm
